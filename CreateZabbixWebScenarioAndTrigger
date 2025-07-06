@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+# coding: utf-8
+       
+  
+from pyzabbix import ZabbixAPI
+import sys
+import argparse
+
+"""
+This is a script to add a web scenario with Application tag and HTTP status check
+"""
+
+def authentication(server_url, user, password):
+    if server_url and user and password:
+        ZABBIX_SERVER = server_url
+        zapi = ZabbixAPI(ZABBIX_SERVER)
+        try:
+            # Login to the Zabbix API
+            zapi.login(user, password)
+            return zapi
+        except Exception as e:
+            print(f"Authentication error: {e}")
+            sys.exit(1)
+    else:
+        print('Zabbix Server URL, user and password are required')
+        sys.exit(1)
+
+def get_hostid(zapi, hostname):
+    try:
+        hosts = zapi.host.get(filter={'host': hostname}, output="extend")
+        if not hosts:
+            print(f'Host "{hostname}" not found')
+            sys.exit(1)
+        return hosts[0]['hostid']
+    except Exception as e:
+        print(f"Error getting host ID: {e}")
+        sys.exit(1)
+
+def create_web_scenario(zapi, name, url, hostname, app_value, status_codes):
+    # 
+    print ('status code', status_codes)
+    hostid = get_hostid(zapi, hostname)
+    name = name + '_' + url.lstrip('https:').lstrip('//')
+    # 
+    request = zapi.do_request('httptest.get', params={"filter": {"name": name}, "hostids": hostid})
+    if request['result']:
+        print(f'Web scenario "{name}" already exists on host {hostname}')
+        sys.exit(1)
+    
+    try:
+        #Create web scenario
+        params = {
+            "name": name ,
+            "hostid": hostid,
+            "delay": '3m',
+            "retries": '2',
+            "steps": [{
+                'name': name ,
+                'url': url,
+                'status_codes': status_codes,     #HTTP status code
+                'no': '1'
+            }],
+            "tags": [{                   #Application tag
+                "tag": "Application",
+                "value": app_value
+            }]
+        }
+        
+        response = zapi.do_request('httptest.create', params)
+        print(f"Successfully created web scenario '{name}' on host '{hostname}' with HTTP status check: {status_codes}")
+        create_trigger(zapi, name, url, hostname)
+        return response
+    except Exception as e:
+        print(f"Error creating web scenario: {e}")
+        sys.exit(1)
+
+def create_by_file(zapi, hostname, app_value, filename):
+    # Get host ID
+    hostid = get_hostid(zapi, hostname)
+    ##Reading parameters from URL-list.txt file
+    try:
+        with open(filename, 'r', encoding='utf-8') as file_to_parse:
+            for line_number, line in enumerate(file_to_parse, 1):
+                # 
+                values = line.strip().split(',')
+                if len(values) < 2:
+                    print(f"Line {line_number}: Needs at least 2 parameters (name and URL)")
+                    continue
+                
+                
+                  
+                status_codes = '200'
+                name = values[0].strip()
+                url = values[1].strip()
+                #url_name = name + '_' + url
+                
+                                
+                #
+                if len(values) > 2:
+                    status_codes = values[2].strip() if values[2] else '200'
+                
+                create_web_scenario(
+                    zapi, 
+                    name, 
+                    url, 
+                    hostname, 
+                    app_value, 
+                    #url_name, 
+                    status_codes
+                )
+                    
+    except IOError as e:
+        print(f"Could not open file {filename}: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error processing file: {e}")
+        sys.exit(1)
+
+def create_trigger(zapi, name, url, hostname):
+    try:
+        # get host id
+        hostid = get_hostid(zapi, hostname)
+        #name = name + '_' + url
+        trigger = zapi.trigger.create(
+            description = name + '_' + 'Abnormal',
+            ##comments=f"The website below does not respond with expected HTTP status for at least 120 seconds. "
+                    
+            expression=f'last(/{hostname}/web.test.fail["{name}"],#2)>0' ,
+            manual_close = 1,
+            priority=2 
+            #priority:    Severity of the trigger.
+            #Possible values:
+            #0 - (default) not classified;
+            #1 - information;
+            #2 - warning;
+            #3 - average;
+            #4 - high;
+            #5 - disaster.
+        )
+        print(f"Successfully created trigger for: {name}")
+        return trigger
+    except Exception as e:
+        print(f"Error creating trigger: {e}")
+        sys.exit(1)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Create Zabbix web scenarios with HTTP status checks')
+    parser.add_argument("-z", "--zabbix", dest="server_url", required=True, help='URL for Zabbix Server')
+    parser.add_argument('-u', '--user', dest='user', required=True, help='Zabbix API user')
+    parser.add_argument('-p', '--password', dest='password', required=True, help='Zabbix API password')
+    parser.add_argument('-H', '--hostname', dest='hostname', required=True, help='Hostname in Zabbix')
+    parser.add_argument('-v', '--app-value', dest='app_value', required=True, help='Application tag value')
+    
+    # 
+    scenario_group = parser.add_mutually_exclusive_group(required=True)
+    scenario_group.add_argument('-f', '--file', dest='filename', help='CSV file containing Name of the Web Scenario,URL,StatusCodes')
+    #scenario_group.add_argument('-n', '--name', dest='name', help='Name of the Web Scenario')
+    
+    # 
+    parser.add_argument('--url', dest='url', help='URL to monitor')
+    #parser.add_argument('--url-name', dest='url_name', default='Homepage', help='Step name (default: Homepage)')
+    parser.add_argument('--status', dest='status_codes',  help='Expected HTTP status codes (comma separated, e.g., 200,302) (default: 200)')
+    
+    args = parser.parse_args()
+    
+    zapi = authentication(args.server_url, args.user, args.password)
+    
+    if args.filename:
+        create_by_file(
+            zapi, 
+            args.hostname,
+            args.app_value, 
+            args.filename
+        )
+    else:
+        if not args.url:
+            parser.error("--url is required when not using --file")
+        
+        create_web_scenario(
+            zapi, 
+            args.name, 
+            args.url, 
+            args.hostname, 
+            args.app_value, 
+            #args.url_name, 
+            args.status_codes
+        )
+        ###example  
+        ## python.exe .\zabbix-web-scenario.py -z http://10.2.22.18/zabbix -H 'Zabbix server' -u Admin -p 'S&&'  -n [test-google]Google-Web --url https://www.google.com -v URL_Check --status 200
+        ##
+        ##python.exe .\zabbix-web-scenario.py -z http://10.2.22.18/zabbix -H 'Zabbix server' -u Admin -p 'S&&' -v URL_Check -f .\URL-list.txt 
+
+
+        ###url-list.txt
+        ##
+        ##[test-google]Google-Web, https://www.google.com
